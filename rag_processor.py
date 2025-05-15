@@ -1,76 +1,79 @@
+import os, json, shutil, tempfile, logging
+from typing import Any, Tuple
 from langchain_community.document_loaders import UnstructuredPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings, ChatOllama
-from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.chat_models import ChatOllama
 from langchain.prompts import PromptTemplate, ChatPromptTemplate
-import json
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain.schema.runnable import RunnablePassthrough
 
-# 1) Load & split PDF
-
-def load_and_split(pdf_path):
-    loader = UnstructuredPDFLoader(pdf_path)
+PERSIST_DIRECTORY = os.path.join('data','vectors')
+logger = logging.getLogger(__name__)
+SAMPLE_ROLES = [
+    "HR", "Finance", "IT", "Legal", "Sales", "Marketing",
+    "Customer Service", "Product", "Engineering", "Operations"
+]
+def create_vector_db(file_path: str) -> Chroma:
+    temp = tempfile.mkdtemp()
+    loader = UnstructuredPDFLoader(file_path)
     docs = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
-    return splitter.split_documents(docs)
-
-# 2) Build vector store
-
-def build_vector_store(docs):
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    from chromadb import Client as ChromaClient
-    client = ChromaClient()
-    collection = client.create_collection(name="pdf_collection")
-    texts = [d.page_content for d in docs]
-    vectors = embeddings.embed_documents(texts)
-    collection.add(documents=texts, embeddings=vectors)
-    return collection
-
-# 3) RAG analyze: summarize + identify roles
-
-def rag_analyze(pdf_path):
-    docs = load_and_split(pdf_path)
-    vs = build_vector_store(docs)
-    retriever = vs.as_retriever()
-    retriever.search_kwargs = {"k": 5}
-
-    # Summarization chain
-    llm = ChatOllama(model="llama2-70b")
-    sum_prompt = PromptTemplate(
-        input_variables=["context"],
-        template="""
-        Summarize into 3–5 bullet points, highlight any actionable instructions:
-        {context}
-        """
+    splitter = RecursiveCharacterTextSplitter(chunk_size=7500, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
+    emb = OllamaEmbeddings(model='nomic-embed-text')
+    col = Chroma.from_documents(
+        documents=chunks,
+        embedding=emb,
+        persist_directory=PERSIST_DIRECTORY,
+        collection_name=f"pdf_{hash(file_path)}"
     )
-    sum_chain = (
-        retriever
-        | ChatPromptTemplate.from_template(sum_prompt)
-        | llm
-    )
-    # Call with empty query to get top chunks
-    contexts = retriever.get_relevant_documents("")
-    full_context = "\n\n".join([d.page_content for d in contexts])
-    summary = sum_chain.invoke({"context": full_context})
+    shutil.rmtree(temp)
+    return col
 
-    # Role identification chain
-    role_prompt = PromptTemplate(
-        input_variables=["context"],
-        template="""
-        Identify organizational roles/departments to receive this document. Return a JSON list:
-        {context}
-        """
-    )
-    role_chain = (
-        retriever
-        | ChatPromptTemplate.from_template(role_prompt)
-        | llm
-    )
-    roles_json = role_chain.invoke({"context": full_context})
-    roles = json.loads(roles_json)
+def process_pdf(pdf_path: str) -> Tuple[str, list]:
+    vector_db = create_vector_db(pdf_path)
+
+    llm = ChatOllama(model='gemma3:latest')
+
+    retr = vector_db.as_retriever()
+    retr.search_kwargs = {'k': 5}
+
+    docs = retr.get_relevant_documents("")
+    context = '\n\n'.join([doc.page_content for doc in docs])
+
+    sum_prompt_str = "Summarize into 3-5 bullets, highlight instructions:\n{context}"
+    sum_prompt = ChatPromptTemplate.from_template(sum_prompt_str)
+    sum_chain = sum_prompt | llm
+    summary = sum_chain.invoke({"context": context}).content
+
+    role_prompt_str = """
+    You are an assistant that identifies relevant roles or departments from a given list based on a document.
+
+    Only return those roles from the list below that are clearly relevant to the document content.
+    DO NOT return the full list unless all roles are clearly mentioned or implied.
+
+    Respond with a JSON list (no explanations).
+
+    List of available roles:
+    {available_roles}
+
+    Document:
+    {context}
+    """
+
+    role_prompt = ChatPromptTemplate.from_template(role_prompt_str)
+    role_chain = role_prompt | llm
+
+    roles_response = role_chain.invoke({
+        "context": context,
+        "available_roles": ", ".join(SAMPLE_ROLES)
+    })
+
+    try:
+        #roles = json.loads(roles_response.content)
+        roles = roles_response.content
+    except json.JSONDecodeError:
+        roles = []
 
     return summary, roles
-
-# Wrapper
-
-def process_pdf(pdf_path):
-    return rag_analyze(pdf_path)

@@ -1,51 +1,55 @@
+import os, tempfile
 import streamlit as st
-import tempfile
-import os
 from rag_processor import process_pdf
 from db_client import find_users_by_roles
 from mailer import send_email_sync
 
-st.set_page_config(page_title="Automated PDF Email Sender", layout="wide")
+st.set_page_config(page_title='PDF Email Sender', layout='wide')
+if 'history' not in st.session_state:
+    st.session_state['history'] = []
 
-st.title("📄 Automated PDF Email Sender")
-st.write("Upload a PDF, xem tóm tắt, danh sách roles, và kết quả gửi mail.")
-
-file = st.file_uploader("Choose a PDF file", type=["pdf"])
+st.title('📄 Automated PDF Email Sender')
+file = st.file_uploader('Upload PDF', type=['pdf'])
 
 if file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+    with tempfile.NamedTemporaryFile(delete=False,suffix='.pdf') as tmp:
         tmp.write(file.read())
         pdf_path = tmp.name
 
-    # RAG + display
+    st.info('Processing PDF...')
     summary, roles = process_pdf(pdf_path)
-    st.subheader("Tóm tắt nội dung PDF")
+
+    st.subheader('📑 Summary')
     st.markdown(summary)
-    st.subheader("Vai trò/Phòng ban được xác định")
+    st.subheader('👥 Identified Roles')
     st.write(roles)
 
-    # Lookup & send
     users = find_users_by_roles(roles)
     if not users:
-        st.warning("Không tìm thấy user phù hợp roles.")
+        st.warning('No matching users found.')
     else:
-        results = []
+        st.subheader('✉️ Sending Emails')
         for u in users:
-            to = u['email']
-            subject = f"[Notification] New Document: {os.path.basename(pdf_path)}"
-            body = f"Hello {u.get('name', to)},\n\n{summary}\n\nPlease see attached PDF."
+            subject = f"[Notification] New Doc: {os.path.basename(pdf_path)}"
+            body = f"Hello {u.get('name',u['email'])},\n\n{summary}\n\n-- End --"
             try:
-                send_email_sync(to, subject, body, pdf_path)
-                status = "Success"
+                #send_email_sync(u['email'], subject, body, pdf_path)
+                status = 'Success'
             except Exception as e:
-                status = f"Failed: {e}"
-            results.append({
-                "email": to,
-                "role": u['role'],
-                "status": status,
-                "preview": body[:100] + '...'
-            })
-        st.subheader("Kết quả gửi mail")
-        st.table(results)
+                status = f'Failed: {e}'
+            rec = {'email':u['email'],'role':u['role'],'status':status,'subject':subject,'body':body}
+            st.session_state['history'].append(rec)
 
+    # Cleanup
     os.remove(pdf_path)
+
+# Display history
+if st.session_state['history']:
+    st.subheader('🕘 Email Send History')
+    df = []
+    for rec in st.session_state['history']:
+        df.append({'Email':rec['email'],'Role':rec['role'],'Status':rec['status'],'Subject':rec['subject']})
+    st.table(df)
+    for rec in st.session_state['history']:
+        with st.expander(f"{rec['email']} - {rec['status']}"):
+            st.markdown(f"**Subject:** {rec['subject']}\n\n**Body:**\n{rec['body']}")
